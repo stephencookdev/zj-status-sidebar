@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(cargo --version)",
+      "Bash(rustc:*)",
+      "Bash(cargo build:*)",
+      "Bash(rustup target:*)",
+      "Bash(cp:*)",
+      "Bash(zjr)",
+      "Bash(zellij list-sessions:*)",
+      "WebFetch(domain:github.com)"
+    ],
+    "deny": []
+  }
+}

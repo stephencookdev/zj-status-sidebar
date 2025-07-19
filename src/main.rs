@@ -4,13 +4,9 @@ mod tab;
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::convert::TryInto;
 
-use tab::get_tab_to_focus;
 use zellij_tile::prelude::*;
-
-use crate::line::tab_line;
-use crate::tab::tab_style;
+use zellij_tile_utils::style;
 
 use serde::{Deserialize, Serialize};
 
@@ -113,10 +109,11 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Mouse(me) => match me {
-                Mouse::LeftClick(_, col) => {
-                    let tab_to_focus = get_tab_to_focus(&self.tab_line, self.active_tab_idx, col);
-                    if let Some(idx) = tab_to_focus {
-                        switch_tab_to(idx.try_into().unwrap());
+                Mouse::LeftClick(row, _col) => {
+                    // First three rows are header (empty, mode, separator), tabs start at row 3 (0-indexed)
+                    if row >= 3 && (row as usize - 3) < self.tabs.len() {
+                        let tab_index = (row as usize - 3) + 1; // Convert to 1-based tab index
+                        switch_tab_to(tab_index as u32);
                     }
                 }
                 Mouse::ScrollUp(_) => {
@@ -212,75 +209,124 @@ impl ZellijPlugin for State {
         should_render
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
+    fn render(&mut self, rows: usize, cols: usize) {
         if self.tabs.is_empty() {
             return;
         }
-        let mut all_tabs: Vec<LinePart> = vec![];
-        let mut active_tab_index = 0;
-        let mut active_swap_layout_name = None;
-        let mut is_swap_layout_dirty = false;
-        for t in &mut self.tabs {
-            let mut tabname = t.name.clone();
-            if t.active && self.mode_info.mode == InputMode::RenameTab {
-                if tabname.is_empty() {
-                    tabname = String::from("Enter name...");
-                }
-                active_tab_index = t.position;
-            } else if t.active {
-                active_tab_index = t.position;
-                is_swap_layout_dirty = t.is_swap_layout_dirty;
-                active_swap_layout_name = t.active_swap_layout_name.clone();
-            }
-
-            // insert tab index
-            tabname.insert_str(0, &format!("{} ", t.position + 1));
-
-            let mut alternate_color = false;
-            let mut success = false;
-
-            if let Some(i) = self.tab_alerts.get(&t.position) {
-                alternate_color = i.alternate_color;
-                success = i.success;
-            }
-
-            let tab = tab_style(
-                tabname,
-                t,
-                self.mode_info.style.colors,
-                self.mode_info.capabilities,
-                alternate_color,
-                success,
-            );
-            all_tabs.push(tab);
-        }
-        self.tab_line = tab_line(
-            self.mode_info.session_name.as_deref(),
-            all_tabs,
-            active_tab_index,
-            cols.saturating_sub(1),
-            self.mode_info.style.colors,
-            self.mode_info.capabilities,
-            self.mode_info.style.hide_session_name,
-            self.mode_info.mode,
-            &active_swap_layout_name,
-            is_swap_layout_dirty,
-        );
-        let output = self
-            .tab_line
-            .iter()
-            .fold(String::new(), |output, part| output + &part.part);
+        
+        // Clear tab_line for mouse click detection
+        self.tab_line.clear();
+        
         let background = match self.mode_info.style.colors.theme_hue {
             ThemeHue::Dark => self.mode_info.style.colors.black,
             ThemeHue::Light => self.mode_info.style.colors.white,
         };
-        match background {
-            PaletteColor::Rgb((r, g, b)) => {
-                print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", output, r, g, b);
+        
+        let text_color = match self.mode_info.style.colors.theme_hue {
+            ThemeHue::Dark => self.mode_info.style.colors.white,
+            ThemeHue::Light => self.mode_info.style.colors.black,
+        };
+        
+        // Use ANSI escape codes to ensure proper multi-line rendering
+        // First, clear the screen
+        print!("\x1b[2J");
+        
+        // Row 1: Empty for now (could add title later)
+        print!("\x1b[1;1H"); // Move to row 1, column 1
+        let empty_line = style!(text_color, background)
+            .paint(format!("{:width$}", "", width = cols));
+        print!("{}", empty_line);
+        
+        // Row 2: Mode (NORMAL, LOCKED, etc)
+        print!("\x1b[2;1H"); // Move to row 2, column 1
+        let mode_text = format!("{:?}", self.mode_info.mode).to_uppercase();
+        let mode_color = match self.mode_info.mode {
+            InputMode::Locked => self.mode_info.style.colors.magenta,
+            InputMode::Normal => self.mode_info.style.colors.green,
+            _ => self.mode_info.style.colors.orange,
+        };
+        let mode_line = style!(text_color, mode_color)
+            .bold()
+            .paint(format!("{:^width$}", mode_text, width = cols));
+        print!("{}", mode_line);
+        
+        // Row 3: Separator
+        print!("\x1b[3;1H"); // Move to row 3, column 1
+        let separator = "─".repeat(cols);
+        let separator_line = style!(text_color, background)
+            .paint(&separator);
+        print!("{}", separator_line);
+        
+        // Rows 4+: Tabs
+        let mut current_row = 4;
+        for (idx, t) in self.tabs.iter().enumerate() {
+            if current_row > rows {
+                break;
             }
-            PaletteColor::EightBit(color) => {
-                print!("{}\u{1b}[48;5;{}m\u{1b}[0K", output, color);
+            
+            print!("\x1b[{};1H", current_row); // Move to current row, column 1
+            
+            let mut tabname = format!("{} {}", t.position + 1, t.name);
+            if tabname.len() > cols - 2 {
+                tabname.truncate(cols - 5);
+                tabname.push_str("...");
             }
+            
+            let (fg_color, bg_color) = if t.active {
+                (background, text_color)
+            } else {
+                (text_color, background)
+            };
+            
+            // Check for alerts
+            let tab_line = if let Some(alert) = self.tab_alerts.get(&t.position) {
+                let alert_color = if alert.success {
+                    self.mode_info.style.colors.green
+                } else {
+                    self.mode_info.style.colors.red
+                };
+                
+                if alert.alternate_color {
+                    style!(fg_color, alert_color)
+                        .bold()
+                        .paint(format!(" {:width$}", tabname, width = cols - 1))
+                } else {
+                    style!(alert_color, bg_color)
+                        .bold()
+                        .paint(format!(" {:width$}", tabname, width = cols - 1))
+                }
+            } else if t.active {
+                style!(fg_color, bg_color)
+                    .bold()
+                    .paint(format!(" {:width$}", tabname, width = cols - 1))
+            } else {
+                style!(fg_color, bg_color)
+                    .italic()
+                    .paint(format!(" {:width$}", tabname, width = cols - 1))
+            };
+            
+            print!("{}", tab_line);
+            
+            self.tab_line.push(LinePart {
+                part: String::new(),
+                len: cols,
+                tab_index: Some(idx),
+            });
+            
+            current_row += 1;
         }
+        
+        // Fill remaining rows with background
+        while current_row <= rows {
+            print!("\x1b[{};1H", current_row); // Move to current row
+            let empty_line = style!(text_color, background)
+                .paint(format!("{:width$}", "", width = cols));
+            print!("{}", empty_line);
+            current_row += 1;
+        }
+        
+        // Ensure output is flushed
+        use std::io::{self, Write};
+        let _ = io::stdout().flush();
     }
 }
