@@ -187,6 +187,20 @@ fn tab_line_prefix(
 
     let mut parts: Vec<LinePart> = vec![];
 
+    // Add [SIDEBAR] prefix to verify the plugin is working
+    let sidebar_part = "[SIDEBAR] ";
+    let sidebar_part_len = sidebar_part.width();
+    let text_color = match palette.theme_hue {
+        ThemeHue::Dark => palette.white,
+        ThemeHue::Light => palette.black,
+    };
+    let sidebar_part_styled_text = style!(text_color, bg_color).bold().paint(sidebar_part);
+    parts.push(LinePart {
+        part: sidebar_part_styled_text.to_string(),
+        len: sidebar_part_len,
+        tab_index: None,
+    });
+
     if let Some(name) = session_name {
         let name_part = format!(" {} |", name);
         let name_part_len = name_part.width();

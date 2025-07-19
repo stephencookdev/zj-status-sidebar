@@ -1,5 +1,5 @@
 [package]
-name = "zj-status-bar"
+name = "zj-status-sidebar"
 version = "0.3.0"
 authors = ["Cristian Dominguez", "Alexander Kenji Berthold <aks.kenji@protonmail.com>" ]
 edition = "2021"

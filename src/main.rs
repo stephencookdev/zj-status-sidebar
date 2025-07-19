@@ -92,7 +92,7 @@ impl ZellijPlugin for State {
                     // Broadcast the state of tab alerts to all instances of `zj-status-bar` for new
                     // instances to "catch up" on previous alerts.
                     pipe_message_to_plugin(
-                        MessageToPlugin::new("zj-status-bar:plugin:tab_alert:broadcast")
+                        MessageToPlugin::new("zj-status-sidebar:plugin:tab_alert:broadcast")
                             .with_plugin_url("zellij:OWN_URL")
                             .with_payload(serde_json::to_string(&self.tab_alerts).unwrap()),
                     )
@@ -142,7 +142,7 @@ impl ZellijPlugin for State {
         let mut should_render = false;
         match pipe_message.source {
             PipeSource::Cli(_) => {
-                if pipe_message.name == "zj-status-bar:cli:tab_alert" {
+                if pipe_message.name == "zj-status-sidebar:cli:tab_alert" {
                     if let (Some(pane_id_str), Some(exit_code_str)) = (
                         pipe_message.args.get("pane_id"),
                         pipe_message.args.get("exit_code"),
@@ -195,7 +195,7 @@ impl ZellijPlugin for State {
                 // Only read it if the current instance doesn't contain any info (new tab created
                 // after alerts were piped from a pane) to "catch up" and render them.
                 if pipe_message.is_private
-                    && pipe_message.name == "zj-status-bar:plugin:tab_alert:broadcast"
+                    && pipe_message.name == "zj-status-sidebar:plugin:tab_alert:broadcast"
                     && self.tab_alerts.is_empty()
                 {
                     self.tab_alerts = serde_json::from_str(&pipe_message.payload.unwrap()).unwrap();
