@@ -11,7 +11,14 @@
       "Bash(zjr)",
       "Bash(zellij list-sessions:*)",
       "WebFetch(domain:github.com)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cargo check:*)",
+      "Bash(zellij:*)",
+      "Bash(cargo search:*)",
+      "Bash(rg:*)",
+      "Bash(pgrep:*)",
+      "Bash(/Users/stephen/workspace/zj-status-sidebar/scripts/test-toggle.sh:*)",
+      "WebFetch(domain:zellij.dev)"
     ],
     "deny": []
   }

@@ -1,0 +1,24 @@
+// Example Zellij keybinding configuration for sidebar toggle
+
+keybinds {
+    tab {
+        // Toggle sidebar collapse in Tab mode (Ctrl+t, then t)
+        bind "t" {
+            MessagePlugin "file:~/.config/zellij/plugins/zj-status-sidebar.wasm" {
+                name "toggle_collapse"
+            }
+            SwitchToMode "Normal"
+        }
+    }
+}
+
+// Example layout with sidebar
+layout {
+    // Sidebar (20% width when expanded)
+    pane size="20%" {
+        plugin location="file:~/.config/zellij/plugins/zj-status-sidebar.wasm"
+    }
+    
+    // Main pane
+    pane
+}

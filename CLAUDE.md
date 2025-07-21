@@ -1,7 +1,3 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
 zj-status-sidebar is a Zellij plugin written in Rust that provides an enhanced status bar for the Zellij terminal multiplexer. It's compiled to WebAssembly (wasm32-wasi) and focuses on providing a clean, opinionated status bar experience.
@@ -25,6 +21,8 @@ node scripts/check.js
 The compiled WASM files are located at:
 - Development: `target/wasm32-wasi/debug/zj-status-bar.wasm`
 - Release: `target/wasm32-wasi/release/zj-status-bar.wasm`
+
+After compiling, you should attempt to copy the built plugin so the user can test the plugin in their workspace.
 
 ## Architecture
 

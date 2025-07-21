@@ -3,26 +3,40 @@ mod tab;
 mod names;
 
 use std::cmp::{max, min};
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use zellij_tile::prelude::*;
+use zellij_tile::shim::next_swap_layout;
 use zellij_tile_utils::style;
 
 use serde::{Deserialize, Serialize};
 use crate::names::NameCache;
 
-#[derive(Debug, Default)]
-pub struct LinePart {
-    part: String,
-    len: usize,
-    tab_index: Option<usize>,
-}
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 struct TabAlert {
     success: bool,
     alternate_color: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct StateEntry {
+    timestamp: u64,  // Unix timestamp in milliseconds
+    collapsed: bool,
+}
+
+impl StateEntry {
+    fn new(collapsed: bool) -> Self {
+        Self {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            collapsed,
+        }
+    }
 }
 
 struct State {
@@ -31,10 +45,12 @@ struct State {
     tabs: Vec<TabInfo>,
     active_tab_idx: usize,
     mode_info: ModeInfo,
-    tab_line: Vec<LinePart>,
     name_cache: NameCache,
-    collapsed: bool,
     rows: usize,
+    cols: usize,
+    // Local memory of last 5 states
+    state_history: VecDeque<StateEntry>,
+    last_file_check: Option<Instant>,
 }
 
 impl Default for State {
@@ -45,17 +61,90 @@ impl Default for State {
             tabs: Vec::new(),
             active_tab_idx: 0,
             mode_info: ModeInfo::default(),
-            tab_line: Vec::new(),
             name_cache: NameCache::new(),
-            collapsed: false,
             rows: 0,
+            cols: 0,
+            state_history: VecDeque::with_capacity(5),
+            last_file_check: None,
         }
     }
 }
 
-static ARROW_SEPARATOR: &str = "";
 
 register_plugin!(State);
+
+impl State {
+    // Get the current desired state from local memory
+    fn get_desired_collapsed(&self) -> bool {
+        self.state_history
+            .back()
+            .map(|entry| entry.collapsed)
+            .unwrap_or(false)  // Default to expanded
+    }
+    
+    // Add a new state to local memory
+    fn add_state(&mut self, collapsed: bool) {
+        let entry = StateEntry::new(collapsed);
+        self.state_history.push_back(entry.clone());
+        
+        // Keep only last 5 states
+        while self.state_history.len() > 5 {
+            self.state_history.pop_front();
+        }
+        
+        // Write to file
+        self.write_state_file(&entry);
+    }
+    
+    // Write state to file
+    fn write_state_file(&self, entry: &StateEntry) {
+        let state_file = "/tmp/.zj-sidebar-state.json";
+        if let Ok(json) = serde_json::to_string(entry) {
+            let _ = std::fs::write(state_file, json);
+        }
+    }
+    
+    // Read state from file
+    fn read_state_file(&self) -> Option<StateEntry> {
+        let state_file = "/tmp/.zj-sidebar-state.json";
+        std::fs::read_to_string(state_file)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+    }
+    
+    // Check if we should read the file
+    fn should_check_file(&self) -> bool {
+        if let Some(last_check) = self.last_file_check {
+            // Check every 500ms
+            last_check.elapsed().as_millis() > 500
+        } else {
+            true
+        }
+    }
+    
+    // Update state from file if newer
+    fn update_from_file(&mut self) {
+        if self.should_check_file() {
+            self.last_file_check = Some(Instant::now());
+            
+            if let Some(file_entry) = self.read_state_file() {
+                // Check if file has newer state than our newest
+                let should_update = if let Some(newest) = self.state_history.back() {
+                    file_entry.timestamp > newest.timestamp
+                } else {
+                    true  // No local state yet
+                };
+                
+                if should_update {
+                    self.state_history.push_back(file_entry);
+                    while self.state_history.len() > 5 {
+                        self.state_history.pop_front();
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
@@ -74,13 +163,12 @@ impl ZellijPlugin for State {
             EventType::Timer,
         ]);
         
-        // Check if sidebar was collapsed in previous session
-        let state_file = "/tmp/.zj-sidebar-collapsed";
-        self.collapsed = std::path::Path::new(state_file).exists();
+        // Load initial state from file
+        self.update_from_file();
         
-        // Set as selectable on load so user can accept/deny perms.
-        // After the first load, if the user allowed access, the perm event handler
-        // in `update` will always set it as unselectable.
+        // Start timer for periodic checks
+        set_timeout(0.5);
+        
         set_selectable(true);
     }
 
@@ -97,9 +185,18 @@ impl ZellijPlugin for State {
                 self.mode_info = mode_info
             }
             Event::Timer(_) => {
-                // Skip event if there's no alerts.
-                // This ensures the last timer fired after visited the last tab with an alert don't
-                // cause an infinite re-render loop.
+                // Update from file periodically
+                let old_state = self.get_desired_collapsed();
+                self.update_from_file();
+                let new_state = self.get_desired_collapsed();
+                
+                // If state changed, trigger layout update
+                if old_state != new_state {
+                    next_swap_layout();
+                    should_render = true;
+                }
+                
+                // Handle tab alerts
                 if !self.tab_alerts.is_empty() {
                     for tab_alert in self.tab_alerts.values_mut() {
                         *tab_alert = TabAlert {
@@ -107,26 +204,25 @@ impl ZellijPlugin for State {
                             alternate_color: !tab_alert.alternate_color,
                         }
                     }
-
-                    set_timeout(1.0);
                     should_render = true;
-
-                    // Broadcast the state of tab alerts to all instances of `zj-status-bar` for new
-                    // instances to "catch up" on previous alerts.
-                    pipe_message_to_plugin(
-                        MessageToPlugin::new("zj-status-sidebar:plugin:tab_alert:broadcast")
-                            .with_plugin_url("zellij:OWN_URL")
-                            .with_payload(serde_json::to_string(&self.tab_alerts).unwrap()),
-                    )
                 }
+                
+                // Keep timer running
+                set_timeout(0.5);
             }
             Event::TabUpdate(tabs) => {
                 if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
-                    // tabs are indexed starting from 1 so we need to add 1
                     let active_tab_idx = active_tab_index + 1;
-                    if self.active_tab_idx != active_tab_idx || self.tabs != tabs {
+                    let tab_changed = self.active_tab_idx != active_tab_idx;
+                    
+                    if tab_changed || self.tabs != tabs {
                         self.tab_alerts.remove(&active_tab_index);
                         should_render = true;
+                        
+                        // When tab opens, check file
+                        if tab_changed {
+                            self.update_from_file();
+                        }
                     }
                     self.active_tab_idx = active_tab_idx;
                     self.tabs = tabs;
@@ -135,13 +231,9 @@ impl ZellijPlugin for State {
                 }
             }
             Event::Key(key) => {
-                // Check if we're in Tab mode (after pressing Ctrl+t)
                 if self.mode_info.mode == InputMode::Tab {
-                    // Handle 't' key in Tab mode to toggle collapsed state
-                    if let Key::Char('t') = key {
-                        self.collapsed = !self.collapsed;
+                    if let KeyWithModifier { bare_key: BareKey::Char('t'), .. } = key {
                         should_render = true;
-                        // Switch back to normal mode
                         switch_to_input_mode(&InputMode::Normal);
                     }
                 }
@@ -149,37 +241,22 @@ impl ZellijPlugin for State {
             Event::Mouse(me) => match me {
                 Mouse::LeftClick(row, _col) => {
                     if row == 0 {
-                        // Click on title row toggles collapse
-                        self.collapsed = !self.collapsed;
+                        // Toggle: get current state and flip it
+                        let current = self.get_desired_collapsed();
+                        let new_state = !current;
+                        
+                        // Update local memory first
+                        self.add_state(new_state);
+                        
+                        // Trigger layout change
+                        next_swap_layout();
+                        
                         should_render = true;
-                        
-                        // Write state to filesystem for resize script
-                        let state_file = "/tmp/.zj-sidebar-collapsed";
-                        if self.collapsed {
-                            std::fs::write(state_file, "1").ok();
-                        } else {
-                            std::fs::remove_file(state_file).ok();
-                        }
-                        
-                        // Broadcast collapse state to all plugin instances
-                        pipe_message_to_plugin(
-                            MessageToPlugin {
-                                plugin_url: None,
-                                plugin_config: BTreeMap::new(),
-                                message_name: "sync_collapse_state".to_string(),
-                                message_payload: Some(self.collapsed.to_string()),
-                                message_args: BTreeMap::new(),
-                                new_plugin_args: None,
-                                destination_plugin_id: None,
-                            }
-                        );
                     } else if row >= 2 {
-                        // All tabs are 3 lines tall
                         let tab_height = 3;
-                        // First 2 rows are header (title, spacer), tabs start at row 2 (0-indexed)
                         let tab_idx = (row as usize - 2) / tab_height;
                         if tab_idx < self.tabs.len() {
-                            let tab_number = tab_idx + 1; // Convert to 1-based tab index
+                            let tab_number = tab_idx + 1;
                             switch_tab_to(tab_number as u32);
                         }
                     }
@@ -196,9 +273,7 @@ impl ZellijPlugin for State {
                 PermissionStatus::Granted => set_selectable(false),
                 PermissionStatus::Denied => eprintln!("Permission denied by user."),
             },
-            _ => {
-                eprintln!("Got unrecognized event: {:?}", event);
-            }
+            _ => {}
         };
         should_render
     }
@@ -207,31 +282,18 @@ impl ZellijPlugin for State {
         let mut should_render = false;
         match pipe_message.source {
             PipeSource::Keybind => {
-                // Handle keybinding messages
                 if pipe_message.name == "toggle_collapse" {
-                    self.collapsed = !self.collapsed;
+                    // Toggle: get current state and flip it
+                    let current = self.get_desired_collapsed();
+                    let new_state = !current;
+                    
+                    // Update local memory first
+                    self.add_state(new_state);
+                    
+                    // Trigger layout change
+                    next_swap_layout();
+                    
                     should_render = true;
-                    
-                    // Write state to filesystem for resize script
-                    let state_file = "/tmp/.zj-sidebar-collapsed";
-                    if self.collapsed {
-                        std::fs::write(state_file, "1").ok();
-                    } else {
-                        std::fs::remove_file(state_file).ok();
-                    }
-                    
-                    // Broadcast collapse state to all plugin instances
-                    pipe_message_to_plugin(
-                        MessageToPlugin {
-                            plugin_url: None,
-                            plugin_config: BTreeMap::new(),
-                            message_name: "sync_collapse_state".to_string(),
-                            message_payload: Some(self.collapsed.to_string()),
-                            message_args: BTreeMap::new(),
-                            new_plugin_args: None,
-                            destination_plugin_id: None,
-                        }
-                    );
                 }
             }
             PipeSource::Cli(_) => {
@@ -250,12 +312,10 @@ impl ZellijPlugin for State {
                         };
 
                         for (tab_idx, pane_vec) in &self.pane_info.panes {
-                            // skip panes in current tab
                             if *tab_idx == self.active_tab_idx - 1 {
                                 continue;
                             }
 
-                            // find index of tab containing the pane
                             if pane_vec.iter().any(|p| p.id == pane_id) {
                                 let first_alert = self.tab_alerts.is_empty();
 
@@ -267,14 +327,11 @@ impl ZellijPlugin for State {
                                     },
                                 );
 
-                                // Only fire timer/re-render on the first alert, when the 1st timer
-                                // expires the state is updated there and new timer is set.
                                 if first_alert {
                                     set_timeout(1.0);
                                     should_render = true;
                                 }
 
-                                // tab index found, exit loop
                                 break;
                             }
                         }
@@ -282,69 +339,54 @@ impl ZellijPlugin for State {
                 }
             }
             PipeSource::Plugin(_source_plugin_id) => {
-                // Handle plugin-to-plugin messages
-                if pipe_message.name == "sync_collapse_state" {
-                    if let Some(collapsed_str) = &pipe_message.payload {
-                        if let Ok(new_collapsed) = collapsed_str.parse::<bool>() {
-                            self.collapsed = new_collapsed;
-                            should_render = true;
-                            
-                            // Update state file
-                            let state_file = "/tmp/.zj-sidebar-collapsed";
-                            if self.collapsed {
-                                std::fs::write(state_file, "1").ok();
-                            } else {
-                                std::fs::remove_file(state_file).ok();
+                if pipe_message.is_private
+                    && pipe_message.name == "zj-status-sidebar:plugin:tab_alert:broadcast"
+                {
+                    if self.tab_alerts.is_empty() {
+                        if let Some(payload) = &pipe_message.payload {
+                            if let Ok(new_alerts) = serde_json::from_str::<HashMap<usize, TabAlert>>(payload) {
+                                if self.tab_alerts != new_alerts {
+                                    self.tab_alerts = new_alerts;
+                                    set_timeout(1.0);
+                                    should_render = true;
+                                }
                             }
                         }
                     }
-                } else if pipe_message.is_private
-                    && pipe_message.name == "zj-status-sidebar:plugin:tab_alert:broadcast"
-                    && self.tab_alerts.is_empty()
-                {
-                    self.tab_alerts = serde_json::from_str(&pipe_message.payload.unwrap()).unwrap();
-
-                    // fire 1st timer/re-render
-                    set_timeout(1.0);
-                    should_render = true;
                 }
-            }
-            _ => {
-                should_render = false;
             }
         }
         should_render
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        if self.tabs.is_empty() {
+        if self.tabs.is_empty() || rows == 0 || cols == 0 {
             return;
         }
         
-        // Store rows for mouse click handling
+        self.cols = cols;
         self.rows = rows;
         
-        // Clear tab_line for mouse click detection
-        self.tab_line.clear();
+        // Local memory controls BOTH text display AND pane width
+        let desired_collapsed = self.get_desired_collapsed();
         
-        let background = match self.mode_info.style.colors.theme_hue {
-            ThemeHue::Dark => self.mode_info.style.colors.black,
-            ThemeHue::Light => self.mode_info.style.colors.white,
-        };
+        // Determine if we're actually collapsed based on column width
+        let is_visually_collapsed = self.cols <= 10;
         
-        let text_color = match self.mode_info.style.colors.theme_hue {
-            ThemeHue::Dark => self.mode_info.style.colors.white,
-            ThemeHue::Light => self.mode_info.style.colors.black,
-        };
+        // If mismatch between desired and actual, keep trying to fix it
+        if desired_collapsed != is_visually_collapsed {
+            next_swap_layout();
+        }
         
-        // Use ANSI escape codes to ensure proper multi-line rendering
-        // First, clear the screen
+        let background = self.mode_info.style.colors.ribbon_unselected.background;
+        let text_color = self.mode_info.style.colors.ribbon_unselected.base;
+        
         print!("\x1b[2J");
         
-        // Row 1: Title with toggle button
-        print!("\x1b[1;1H"); // Move to row 1, column 1
-        let toggle_icon = if self.collapsed { "▶" } else { "◀" }; // ▶ or ◀
-        let title = if self.collapsed { 
+        // Row 1: Title
+        print!("\x1b[1;1H");
+        let toggle_icon = if desired_collapsed { "▶" } else { "◀" };
+        let title = if desired_collapsed { 
             if cols >= 6 {
                 format!(" {} 📌 ", toggle_icon)
             } else {
@@ -358,27 +400,24 @@ impl ZellijPlugin for State {
             .paint(format!("{:^width$}", title, width = cols));
         print!("{}", title_line);
         
-        // Row 2: Empty spacer
-        print!("\x1b[2;1H"); // Move to row 2, column 1
+        // Row 2: Spacer
+        print!("\x1b[2;1H");
         let empty_line = style!(text_color, background)
             .paint(format!("{:width$}", "", width = cols));
         print!("{}", empty_line);
         
-        // All tabs are 3 lines tall
+        // Tabs
         let tab_height = 3;
-        
-        // Rows 3+: Tabs
         let mut current_row = 3;
-        for (idx, t) in self.tabs.iter().enumerate() {
+        
+        for (_idx, t) in self.tabs.iter().enumerate() {
             if current_row + tab_height - 1 > rows {
                 break;
             }
             
-            // Get emoji for this tab (always use from cache)
             let generated_name = self.name_cache.get_or_generate(t.position).to_string();
             let emoji = generated_name.split_whitespace().next().unwrap_or("📄").to_string();
             
-            // Use custom name if available, otherwise use generated name
             let display_name = if !t.name.is_empty() && !t.name.starts_with("Tab ") {
                 format!("{} {}", emoji, t.name)
             } else {
@@ -391,13 +430,12 @@ impl ZellijPlugin for State {
                 (text_color, background)
             };
             
-            // Check for alerts
             let alert_info = self.tab_alerts.get(&t.position);
             let (final_fg, final_bg) = if let Some(alert) = alert_info {
                 let alert_color = if alert.success {
-                    self.mode_info.style.colors.green
+                    self.mode_info.style.colors.frame_highlight.background
                 } else {
-                    self.mode_info.style.colors.red
+                    self.mode_info.style.colors.frame_unselected.unwrap_or_default().background
                 };
                 if alert.alternate_color {
                     (fg_color, alert_color)
@@ -408,78 +446,112 @@ impl ZellijPlugin for State {
                 (fg_color, bg_color)
             };
             
-            // Render tab across multiple rows
             for row_offset in 0..tab_height {
                 print!("\x1b[{};1H", current_row + row_offset);
                 
                 let content = if row_offset == 0 || row_offset == 2 {
-                    // First and last rows: empty for spacing
                     String::from("")
                 } else if row_offset == 1 {
-                    // Middle row: content
-                    if self.collapsed {
-                        // Just show emoji when collapsed, centered if space allows
+                    // Use desired state for display
+                    if desired_collapsed {
                         if cols >= 3 {
                             format!("{:^width$}", emoji, width = cols)
                         } else {
                             emoji.chars().next().unwrap_or(' ').to_string()
                         }
                     } else {
-                        // Show full name
                         format!(" {}", display_name)
                     }
                 } else {
                     String::from("")
                 };
                 
-                let formatted_content = if cols <= 3 {
-                    // Very narrow - just show first character or space
-                    content.chars().next().unwrap_or(' ').to_string()
-                } else if content.len() > cols {
-                    // Truncate if needed
-                    if cols > 4 {
-                        let mut truncated = content[..cols - 4].to_string();
-                        truncated.push_str("...");
-                        truncated
-                    } else {
-                        content[..cols.min(content.len())].to_string()
-                    }
-                } else {
-                    content
-                };
+                let formatted_content = safe_truncate_to_width(&content, cols);
                 
                 let tab_line = if t.active {
                     style!(final_fg, final_bg)
                         .bold()
-                        .paint(format!("{:width$}", formatted_content, width = cols))
+                        .paint(&formatted_content)
                 } else {
                     style!(final_fg, final_bg)
-                        .paint(format!("{:width$}", formatted_content, width = cols))
+                        .paint(&formatted_content)
                 };
                 
                 print!("{}", tab_line);
             }
             
-            self.tab_line.push(LinePart {
-                part: String::new(),
-                len: cols,
-                tab_index: Some(idx),
-            });
-            
             current_row += tab_height;
         }
         
-        // Fill remaining rows with background
+        // Fill remaining
         while current_row <= rows {
-            print!("\x1b[{};1H", current_row); // Move to current row
+            print!("\x1b[{};1H", current_row);
             let empty_line = style!(text_color, background)
                 .paint(format!("{:width$}", "", width = cols));
             print!("{}", empty_line);
             current_row += 1;
         }
         
-        // Ensure output is flushed
         use std::io::{self, Write};
         let _ = io::stdout().flush();
     }
+}
+
+fn safe_truncate_to_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    
+    let display_width = s.width();
+    
+    if display_width <= max_width {
+        return format!("{:width$}", s, width = max_width);
+    }
+    
+    if max_width <= 3 {
+        let mut result = String::new();
+        let mut current_width = 0;
+        
+        for ch in s.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if current_width + ch_width <= max_width {
+                result.push(ch);
+                current_width += ch_width;
+            } else {
+                break;
+            }
+        }
+        
+        while current_width < max_width {
+            result.push(' ');
+            current_width += 1;
+        }
+        
+        return result;
+    }
+    
+    let target_width = max_width.saturating_sub(3);
+    let mut result = String::new();
+    let mut current_width = 0;
+    
+    for ch in s.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width + ch_width <= target_width {
+            result.push(ch);
+            current_width += ch_width;
+        } else {
+            break;
+        }
+    }
+    
+    result.push_str("...");
+    
+    let final_width = result.width();
+    if final_width < max_width {
+        for _ in final_width..max_width {
+            result.push(' ');
+        }
+    }
+    
+    result
 }

@@ -1,0 +1,13 @@
+// Zellij layout with expanded sidebar (20% width)
+layout {
+    default_tab_template {
+        pane size="20%" {
+            plugin location="file:~/.config/zellij/plugins/zj-status-sidebar.wasm"
+        }
+        children
+    }
+    
+    tab name="Tab 1" {
+        pane
+    }
+}
