@@ -18,7 +18,11 @@
       "Bash(rg:*)",
       "Bash(pgrep:*)",
       "Bash(/Users/stephen/workspace/zj-status-sidebar/scripts/test-toggle.sh:*)",
-      "WebFetch(domain:zellij.dev)"
+      "WebFetch(domain:zellij.dev)",
+      "Bash(mkdir:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo deploy:*)"
     ],
     "deny": []
   }

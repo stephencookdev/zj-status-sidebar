@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "xtask"]
+
 [package]
 name = "zj-status-sidebar"
 version = "0.3.0"

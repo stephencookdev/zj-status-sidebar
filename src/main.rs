@@ -3,8 +3,8 @@ mod tab;
 mod names;
 
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use zellij_tile::prelude::*;
@@ -48,9 +48,9 @@ struct State {
     name_cache: NameCache,
     rows: usize,
     cols: usize,
-    // Local memory of last 5 states
-    state_history: VecDeque<StateEntry>,
-    last_file_check: Option<Instant>,
+    // Single most recent state
+    collapsed_state: Option<StateEntry>,
+    last_file_mtime: Option<SystemTime>,
 }
 
 impl Default for State {
@@ -64,8 +64,8 @@ impl Default for State {
             name_cache: NameCache::new(),
             rows: 0,
             cols: 0,
-            state_history: VecDeque::with_capacity(5),
-            last_file_check: None,
+            collapsed_state: None,
+            last_file_mtime: None,
         }
     }
 }
@@ -76,8 +76,8 @@ register_plugin!(State);
 impl State {
     // Get the current desired state from local memory
     fn get_desired_collapsed(&self) -> bool {
-        self.state_history
-            .back()
+        self.collapsed_state
+            .as_ref()
             .map(|entry| entry.collapsed)
             .unwrap_or(false)  // Default to expanded
     }
@@ -85,22 +85,23 @@ impl State {
     // Add a new state to local memory
     fn add_state(&mut self, collapsed: bool) {
         let entry = StateEntry::new(collapsed);
-        self.state_history.push_back(entry.clone());
+        self.collapsed_state = Some(entry.clone());
         
-        // Keep only last 5 states
-        while self.state_history.len() > 5 {
-            self.state_history.pop_front();
-        }
-        
-        // Write to file
+        // Write to file atomically
         self.write_state_file(&entry);
     }
     
     // Write state to file
     fn write_state_file(&self, entry: &StateEntry) {
         let state_file = "/tmp/.zj-sidebar-state.json";
+        let temp_file = "/tmp/.zj-sidebar-state.json.tmp";
+        
         if let Ok(json) = serde_json::to_string(entry) {
-            let _ = std::fs::write(state_file, json);
+            // Write to temp file first
+            if std::fs::write(temp_file, json).is_ok() {
+                // Atomic rename on Unix
+                let _ = std::fs::rename(temp_file, state_file);
+            }
         }
     }
     
@@ -112,35 +113,53 @@ impl State {
             .and_then(|content| serde_json::from_str(&content).ok())
     }
     
-    // Check if we should read the file
-    fn should_check_file(&self) -> bool {
-        if let Some(last_check) = self.last_file_check {
-            // Check every 500ms
-            last_check.elapsed().as_millis() > 500
-        } else {
-            true
+    // Check if file has been modified since last check
+    fn file_modified_since_last_check(&self) -> bool {
+        let state_file = "/tmp/.zj-sidebar-state.json";
+        
+        // Get file metadata
+        let Ok(metadata) = std::fs::metadata(state_file) else {
+            return false;
+        };
+        
+        // Get file modification time
+        let Ok(mtime) = metadata.modified() else {
+            return false;
+        };
+        
+        // Check if newer than our last known mtime
+        match self.last_file_mtime {
+            Some(last_mtime) => mtime > last_mtime,
+            None => true,  // First check
         }
     }
     
     // Update state from file if newer
     fn update_from_file(&mut self) {
-        if self.should_check_file() {
-            self.last_file_check = Some(Instant::now());
+        // Only read file if it has been modified
+        if !self.file_modified_since_last_check() {
+            return;
+        }
+        
+        let state_file = "/tmp/.zj-sidebar-state.json";
+        
+        // Update our last known mtime
+        if let Ok(metadata) = std::fs::metadata(state_file) {
+            if let Ok(mtime) = metadata.modified() {
+                self.last_file_mtime = Some(mtime);
+            }
+        }
+        
+        // Read and parse the file
+        if let Some(file_entry) = self.read_state_file() {
+            // Check if file has newer state than our current
+            let should_update = match &self.collapsed_state {
+                Some(current) => file_entry.timestamp > current.timestamp,
+                None => true,  // No local state yet
+            };
             
-            if let Some(file_entry) = self.read_state_file() {
-                // Check if file has newer state than our newest
-                let should_update = if let Some(newest) = self.state_history.back() {
-                    file_entry.timestamp > newest.timestamp
-                } else {
-                    true  // No local state yet
-                };
-                
-                if should_update {
-                    self.state_history.push_back(file_entry);
-                    while self.state_history.len() > 5 {
-                        self.state_history.pop_front();
-                    }
-                }
+            if should_update {
+                self.collapsed_state = Some(file_entry);
             }
         }
     }

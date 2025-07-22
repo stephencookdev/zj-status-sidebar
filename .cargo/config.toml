@@ -1,2 +1,5 @@
 [build]
 target = "wasm32-wasip1"
+
+[alias]
+deploy = "run --target aarch64-apple-darwin --package xtask -- install"
