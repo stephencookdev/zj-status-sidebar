@@ -51,6 +51,9 @@ struct State {
     // Single most recent state
     collapsed_state: Option<StateEntry>,
     last_file_mtime: Option<SystemTime>,
+    // Exponential backoff state
+    poll_interval_ms: f64,
+    last_poll_time: Option<SystemTime>,
 }
 
 impl Default for State {
@@ -66,6 +69,8 @@ impl Default for State {
             cols: 0,
             collapsed_state: None,
             last_file_mtime: None,
+            poll_interval_ms: 10.0,  // Start at 10ms
+            last_poll_time: None,
         }
     }
 }
@@ -101,6 +106,7 @@ impl State {
             if std::fs::write(temp_file, json).is_ok() {
                 // Atomic rename on Unix
                 let _ = std::fs::rename(temp_file, state_file);
+                eprintln!("[zj-status-sidebar] Wrote state to file: collapsed={}", entry.collapsed);
             }
         }
     }
@@ -151,6 +157,7 @@ impl State {
         }
         
         // Read and parse the file
+        eprintln!("[zj-status-sidebar] Reading state file");
         if let Some(file_entry) = self.read_state_file() {
             // Check if file has newer state than our current
             let should_update = match &self.collapsed_state {
@@ -159,6 +166,7 @@ impl State {
             };
             
             if should_update {
+                eprintln!("[zj-status-sidebar] Updated state from file: collapsed={}", file_entry.collapsed);
                 self.collapsed_state = Some(file_entry);
             }
         }
@@ -185,8 +193,14 @@ impl ZellijPlugin for State {
         // Load initial state from file
         self.update_from_file();
         
-        // Start timer for periodic checks
-        set_timeout(0.5);
+        // Set session seed if we have session name
+        if let Some(ref session_name) = self.mode_info.session_name {
+            self.name_cache.set_session_seed(session_name);
+        }
+        
+        // Start timer with initial interval (10ms = 0.01s)
+        set_timeout(self.poll_interval_ms / 1000.0);
+        eprintln!("[zj-status-sidebar] Starting file polling with {}ms interval", self.poll_interval_ms);
         
         set_selectable(true);
     }
@@ -200,20 +214,47 @@ impl ZellijPlugin for State {
             Event::ModeUpdate(mode_info) => {
                 if self.mode_info != mode_info {
                     should_render = true;
+                    
+                    // Set session seed when we get session name
+                    if let Some(ref session_name) = mode_info.session_name {
+                        self.name_cache.set_session_seed(session_name);
+                    }
                 }
                 self.mode_info = mode_info
             }
             Event::Timer(_) => {
-                // Update from file periodically
-                let old_state = self.get_desired_collapsed();
-                self.update_from_file();
-                let new_state = self.get_desired_collapsed();
+                let now = SystemTime::now();
                 
-                // If state changed, trigger layout update
-                if old_state != new_state {
-                    next_swap_layout();
-                    should_render = true;
+                // Check if file was modified
+                let file_was_modified = self.file_modified_since_last_check();
+                
+                if file_was_modified {
+                    eprintln!("[zj-status-sidebar] File modified, updating state (poll interval: {}ms)", self.poll_interval_ms);
+                    
+                    // Update from file
+                    let old_state = self.get_desired_collapsed();
+                    self.update_from_file();
+                    let new_state = self.get_desired_collapsed();
+                    
+                    // If state changed, trigger layout update
+                    if old_state != new_state {
+                        next_swap_layout();
+                        should_render = true;
+                    }
+                    
+                    // Reset backoff to initial interval
+                    self.poll_interval_ms = 10.0;
+                    eprintln!("[zj-status-sidebar] Reset poll interval to 10ms");
+                } else {
+                    // No change, increase backoff
+                    let old_interval = self.poll_interval_ms;
+                    self.poll_interval_ms = (self.poll_interval_ms * 4.0).min(30000.0);
+                    if old_interval != self.poll_interval_ms {
+                        eprintln!("[zj-status-sidebar] No file change, increased poll interval to {}ms", self.poll_interval_ms);
+                    }
                 }
+                
+                self.last_poll_time = Some(now);
                 
                 // Handle tab alerts
                 if !self.tab_alerts.is_empty() {
@@ -226,10 +267,24 @@ impl ZellijPlugin for State {
                     should_render = true;
                 }
                 
-                // Keep timer running
-                set_timeout(0.5);
+                // Schedule next timer with backoff interval
+                set_timeout(self.poll_interval_ms / 1000.0);
             }
             Event::TabUpdate(tabs) => {
+                // Store old state before update
+                let old_desired = self.get_desired_collapsed();
+                
+                // Always check for state updates on tab events
+                self.update_from_file();
+                
+                // Check if desired state changed
+                let new_desired = self.get_desired_collapsed();
+                if old_desired != new_desired {
+                    // State changed, trigger layout update immediately
+                    next_swap_layout();
+                    eprintln!("[zj-status-sidebar] State changed during tab update, triggering layout swap");
+                }
+                
                 if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
                     let active_tab_idx = active_tab_index + 1;
                     let tab_changed = self.active_tab_idx != active_tab_idx;
@@ -238,9 +293,10 @@ impl ZellijPlugin for State {
                         self.tab_alerts.remove(&active_tab_index);
                         should_render = true;
                         
-                        // When tab opens, check file
+                        // When tab changes, reset backoff
                         if tab_changed {
-                            self.update_from_file();
+                            self.poll_interval_ms = 10.0;
+                            eprintln!("[zj-status-sidebar] Tab changed, reset poll interval to 10ms");
                         }
                     }
                     self.active_tab_idx = active_tab_idx;
@@ -251,11 +307,21 @@ impl ZellijPlugin for State {
             }
             Event::Key(key) => {
                 if self.mode_info.mode == InputMode::Tab {
-                    if let KeyWithModifier { bare_key: BareKey::Char('t'), .. } = key {
-                        // Don't render here - let Zellij handle the mode switch
-                        // The ModeUpdate event will trigger a render if needed
-                        switch_to_input_mode(&InputMode::Normal);
+                    match key {
+                        KeyWithModifier { bare_key: BareKey::Char('t'), .. } => {
+                            // Don't render here - let Zellij handle the mode switch
+                            // The ModeUpdate event will trigger a render if needed
+                            switch_to_input_mode(&InputMode::Normal);
+                        }
+                        KeyWithModifier { bare_key: BareKey::Char('r'), .. } => {
+                            // User pressed 'r' to rename tab - trigger a render to show rename UI
+                            should_render = true;
+                        }
+                        _ => {}
                     }
+                } else if self.mode_info.mode == InputMode::RenameTab {
+                    // We're in rename mode - always render to show the input
+                    should_render = true;
                 }
             }
             Event::Mouse(me) => match me {
@@ -394,6 +460,7 @@ impl ZellijPlugin for State {
         let is_visually_collapsed = self.cols <= 10;
         
         // If mismatch between desired and actual, keep trying to fix it
+        // We handle the initial trigger in event handlers, this is just for persistence
         if desired_collapsed != is_visually_collapsed {
             next_swap_layout();
         }
@@ -444,6 +511,20 @@ impl ZellijPlugin for State {
                 generated_name.clone()
             };
             
+            // Show rename indicator if this is the active tab and we're in rename mode
+            let is_renaming = t.active && self.mode_info.mode == InputMode::RenameTab;
+            let display_name_with_indicator = if is_renaming {
+                // Replace the emoji with pencil, keep the rest of the name
+                let name_parts: Vec<&str> = display_name.splitn(2, ' ').collect();
+                if name_parts.len() > 1 {
+                    format!("✏️ {}", name_parts[1])
+                } else {
+                    format!("✏️ {}", display_name)
+                }
+            } else {
+                display_name
+            };
+            
             let (fg_color, bg_color) = if t.active {
                 (background, text_color)
             } else {
@@ -477,7 +558,7 @@ impl ZellijPlugin for State {
                         // Just the emoji, no padding - let safe_truncate_to_width handle centering
                         emoji.clone()
                     } else {
-                        format!(" {}", display_name)
+                        format!(" {}", display_name_with_indicator)
                     }
                 } else {
                     String::from("")
