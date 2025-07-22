@@ -252,7 +252,8 @@ impl ZellijPlugin for State {
             Event::Key(key) => {
                 if self.mode_info.mode == InputMode::Tab {
                     if let KeyWithModifier { bare_key: BareKey::Char('t'), .. } = key {
-                        should_render = true;
+                        // Don't render here - let Zellij handle the mode switch
+                        // The ModeUpdate event will trigger a render if needed
                         switch_to_input_mode(&InputMode::Normal);
                     }
                 }
@@ -473,11 +474,8 @@ impl ZellijPlugin for State {
                 } else if row_offset == 1 {
                     // Use desired state for display
                     if desired_collapsed {
-                        if cols >= 3 {
-                            format!("{:^width$}", emoji, width = cols)
-                        } else {
-                            emoji.chars().next().unwrap_or(' ').to_string()
-                        }
+                        // Just the emoji, no padding - let safe_truncate_to_width handle centering
+                        emoji.clone()
                     } else {
                         format!(" {}", display_name)
                     }
@@ -524,6 +522,16 @@ fn safe_truncate_to_width(s: &str, max_width: usize) -> String {
     let display_width = s.width();
     
     if display_width <= max_width {
+        // For single emojis or very short strings, center them
+        if display_width <= 2 && max_width >= 3 {
+            let padding = (max_width - display_width) / 2;
+            let mut result = " ".repeat(padding);
+            result.push_str(s);
+            while result.width() < max_width {
+                result.push(' ');
+            }
+            return result;
+        }
         return format!("{:width$}", s, width = max_width);
     }
     
