@@ -15,10 +15,29 @@ use serde::{Deserialize, Serialize};
 use crate::names::NameCache;
 
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+enum AlertType {
+    CommandResult { success: bool },
+    Notification,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct TabAlert {
-    success: bool,
+    alert_type: AlertType,
     alternate_color: bool,
+    flash_count: u8,  // For notifications, counts down from 5
+    persistent: bool, // For notifications, stays until tab is opened
+}
+
+impl Default for TabAlert {
+    fn default() -> Self {
+        Self {
+            alert_type: AlertType::CommandResult { success: true },
+            alternate_color: false,
+            flash_count: 0,
+            persistent: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -174,7 +193,9 @@ impl State {
 }
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        eprintln!("[zj-status-sidebar] Plugin instance loading at {:?}", std::time::SystemTime::now());
+        eprintln!("[zj-status-sidebar] Config: {:?}", configuration);
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -256,14 +277,37 @@ impl ZellijPlugin for State {
                 
                 self.last_poll_time = Some(now);
                 
-                // Handle tab alerts
+                // Handle tab alerts and notifications
                 if !self.tab_alerts.is_empty() {
-                    for tab_alert in self.tab_alerts.values_mut() {
-                        *tab_alert = TabAlert {
-                            success: tab_alert.success,
-                            alternate_color: !tab_alert.alternate_color,
+                    let mut alerts_to_remove = Vec::new();
+                    
+                    for (tab_idx, tab_alert) in self.tab_alerts.iter_mut() {
+                        match &tab_alert.alert_type {
+                            AlertType::CommandResult { .. } => {
+                                // Toggle color for command results
+                                tab_alert.alternate_color = !tab_alert.alternate_color;
+                            }
+                            AlertType::Notification => {
+                                // Handle notification flashing
+                                if tab_alert.flash_count > 0 {
+                                    tab_alert.alternate_color = !tab_alert.alternate_color;
+                                    if tab_alert.alternate_color {
+                                        // Only decrement on the "off" phase of flash
+                                        tab_alert.flash_count -= 1;
+                                    }
+                                } else if !tab_alert.persistent {
+                                    // Remove non-persistent notifications after flashing
+                                    alerts_to_remove.push(*tab_idx);
+                                }
+                            }
                         }
                     }
+                    
+                    // Remove finished alerts
+                    for idx in alerts_to_remove {
+                        self.tab_alerts.remove(&idx);
+                    }
+                    
                     should_render = true;
                 }
                 
@@ -290,7 +334,11 @@ impl ZellijPlugin for State {
                     let tab_changed = self.active_tab_idx != active_tab_idx;
                     
                     if tab_changed || self.tabs != tabs {
-                        self.tab_alerts.remove(&active_tab_index);
+                        // Remove alerts when tab becomes active (using position, not index)
+                        if active_tab_index < tabs.len() {
+                            let active_tab_position = tabs[active_tab_index].position;
+                            self.tab_alerts.remove(&active_tab_position);
+                        }
                         should_render = true;
                         
                         // When tab changes, reset backoff
@@ -408,8 +456,10 @@ impl ZellijPlugin for State {
                                 self.tab_alerts.insert(
                                     *tab_idx,
                                     TabAlert {
-                                        success: exit_code == 0,
+                                        alert_type: AlertType::CommandResult { success: exit_code == 0 },
                                         alternate_color: true,
+                                        flash_count: 0,
+                                        persistent: false,
                                     },
                                 );
 
@@ -421,6 +471,56 @@ impl ZellijPlugin for State {
                                 break;
                             }
                         }
+                    }
+                } else if pipe_message.name == "zj-status-sidebar:cli:notify" {
+                    // Handle notification request
+                    // Usage: zellij pipe --name "zj-status-sidebar:cli:notify" --args "tab=1"
+                    //    or: zellij pipe --name "zj-status-sidebar:cli:notify" --args "tab_name=main"
+                    
+                    let tab_idx = if let Some(tab_str) = pipe_message.args.get("tab") {
+                        // Tab specified by index (1-based)
+                        match tab_str.parse::<usize>() {
+                            Ok(idx) if idx > 0 => Some(idx - 1),
+                            _ => None,
+                        }
+                    } else if let Some(tab_name) = pipe_message.args.get("tab_name") {
+                        // Tab specified by name
+                        self.tabs.iter().position(|t| t.name == *tab_name)
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(idx) = tab_idx {
+                        // Get the tab position for the tab alerts map
+                        if idx < self.tabs.len() {
+                            let tab_position = self.tabs[idx].position;
+                            
+                            // Don't notify the active tab
+                            if idx != self.active_tab_idx - 1 {
+                                let first_alert = self.tab_alerts.is_empty();
+                                
+                                self.tab_alerts.insert(
+                                    tab_position,
+                                    TabAlert {
+                                        alert_type: AlertType::Notification,
+                                        alternate_color: false,
+                                        flash_count: 10,  // 5 full flashes (on/off = 2 states)
+                                        persistent: true,
+                                    },
+                                );
+                                
+                                if first_alert {
+                                    set_timeout(0.2);  // Faster timer for flashing
+                                }
+                                should_render = true;
+                                
+                                eprintln!("[zj-status-sidebar] Notification sent to tab {} (position {})", idx + 1, tab_position);
+                            }
+                        } else {
+                            eprintln!("[zj-status-sidebar] Tab index out of range");
+                        }
+                    } else {
+                        eprintln!("[zj-status-sidebar] Invalid tab specified for notification");
                     }
                 }
             }
@@ -460,7 +560,6 @@ impl ZellijPlugin for State {
         let is_visually_collapsed = self.cols <= 10;
         
         // If mismatch between desired and actual, keep trying to fix it
-        // We handle the initial trigger in event handlers, this is just for persistence
         if desired_collapsed != is_visually_collapsed {
             next_swap_layout();
         }
@@ -513,7 +612,7 @@ impl ZellijPlugin for State {
             
             // Show rename indicator if this is the active tab and we're in rename mode
             let is_renaming = t.active && self.mode_info.mode == InputMode::RenameTab;
-            let display_name_with_indicator = if is_renaming {
+            let mut display_name_with_indicator = if is_renaming {
                 // Replace the emoji with pencil, keep the rest of the name
                 let name_parts: Vec<&str> = display_name.splitn(2, ' ').collect();
                 if name_parts.len() > 1 {
@@ -532,20 +631,46 @@ impl ZellijPlugin for State {
             };
             
             let alert_info = self.tab_alerts.get(&t.position);
-            let (final_fg, final_bg) = if let Some(alert) = alert_info {
-                let alert_color = if alert.success {
-                    self.mode_info.style.colors.frame_highlight.background
-                } else {
-                    self.mode_info.style.colors.frame_unselected.unwrap_or_default().background
-                };
-                if alert.alternate_color {
-                    (fg_color, alert_color)
-                } else {
-                    (alert_color, bg_color)
+            let (final_fg, final_bg, notification_indicator) = if let Some(alert) = alert_info {
+                match &alert.alert_type {
+                    AlertType::CommandResult { success } => {
+                        let alert_color = if *success {
+                            self.mode_info.style.colors.frame_highlight.background
+                        } else {
+                            self.mode_info.style.colors.frame_unselected.unwrap_or_default().background
+                        };
+                        let (fg, bg) = if alert.alternate_color {
+                            (fg_color, alert_color)
+                        } else {
+                            (alert_color, bg_color)
+                        };
+                        (fg, bg, None)
+                    }
+                    AlertType::Notification => {
+                        // Red color for notifications
+                        let red_color = self.mode_info.style.colors.frame_unselected.unwrap_or_default().background;
+                        let (fg, bg) = if alert.alternate_color || alert.flash_count == 0 {
+                            (fg_color, red_color)
+                        } else {
+                            (fg_color, bg_color)
+                        };
+                        (fg, bg, Some("🔴"))
+                    }
                 }
             } else {
-                (fg_color, bg_color)
+                (fg_color, bg_color, None)
             };
+            
+            // Add notification indicator to the display name
+            if let Some(indicator) = notification_indicator {
+                if desired_collapsed {
+                    // In collapsed mode, replace emoji with notification indicator
+                    display_name_with_indicator = indicator.to_string();
+                } else {
+                    // In expanded mode, prepend the indicator
+                    display_name_with_indicator = format!("{} {}", indicator, display_name_with_indicator);
+                }
+            }
             
             for row_offset in 0..tab_height {
                 print!("\x1b[{};1H", current_row + row_offset);
